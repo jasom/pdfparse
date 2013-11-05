@@ -97,6 +97,7 @@
 (defgeneric %parse-hexstring (self s i))
 (defgeneric parser-add-results (self &rest objs))
 (defgeneric get-filters (self))
+(defgeneric parser-run (self))
 
 (defmethod initialize-instance :after ((self ps-base-parser) &rest r)
   (declare (ignore r))
@@ -812,6 +813,7 @@ baa") (180 . "foobaa")
 (define-condition pdf-value-error (pdf-exception) ())
 (define-condition pdf-not-implemented-error (pdf-exception) ())
 (define-condition ps-syntax-error (error) ())
+(define-condition cmap-not-found (error) ())
 
 (defclass pdf-obj-ref ()
   ((objid :initarg :objid)
@@ -1410,6 +1412,13 @@ Attributes:
 	       :initial-contents
 	       (map 'list #'char-code string))
    r))
+
+(defun make-be-uint32 (v)
+  (let ((ar (make-array 4 :element-type '(unsigned-byte 8))))
+    (loop for i from 3 downto 0 by 1
+       do (setf (aref ar i) (logand v #xff)
+		v (ash v -8)))
+    ar))
 
 (defun make-le-int32 (v)
   (if (>= v 0)
@@ -2104,6 +2113,7 @@ allocated multiple times.
 	  (error "Type is not /Font"))
 	(let ((subtype
 	       (gethash (lit "Subtype") spec)))
+	  ;(format t "Subtype: ~s~%" subtype)
 	  (unless subtype
 	    (when *strict*
 	      (error "Font Subtype is not specified"))
@@ -2112,16 +2122,24 @@ allocated multiple times.
 	      ((font
 		(case subtype
 		  ((ps-literal::|Type1| ps-literal::|MMType1|)
-		   (make-pdf-type1-font spec))
+		   (make-pdf-type1-font self spec))
 		  (ps-literal::|TrueType|
-			       (make-pdf-true-type-font spec))
+			       (make-pdf-true-type-font self spec))
 		  (ps-literal::|Type3|
-			       (make-pdf-type3-font spec))
+			       (make-pdf-type3-font self spec))
 		  ((ps-literal::|CIDFontType0| ps-literal::|CIDFontType2|)
-		   (make-pdf-cid-font spec))
+		   (make-pdf-cid-font self spec))
+		  (#.(lit "Type0")
+		     (let* ((dfonts (list-value (gethash (lit "DescendantFonts") spec)))
+			    (subspec (copy-hash-table (dict-value (first dfonts)))))
+		       (loop for k in (list (lit "Encoding") (lit "ToUnicode"))
+			    for v = (gethash k spec)
+			  when v do (setf (gethash k subspec) (resolve1 (gethash k spec))))
+		       (get-font self nil subspec)))
+		       
 		  (t
-		   (when *strict* (error "Invalid Font spec: ~s" spec))
-		   (make-pdf-type1-font spec)))))
+		   (when *strict* (error "Invalid Font spec: ~s" (hash-table-plist spec)))
+		   (make-pdf-type1-font self spec)))))
 	    (when (and objid caching)
 	      (setf (gethash objid %cached-fonts) font))
 	    font))))))
@@ -2259,7 +2277,7 @@ allocated multiple times.
 	  fontmap (make-hash-table)
 	  xobjmap (make-hash-table)
 	  csmap (copy-hash-table +predefined-colorspace+))
-    (unless resources
+    (when resources
       (flet ((get-colorspace (spec)
 	       (let ((name (if (listp spec) (car spec) spec)))
 		 (cond
@@ -2287,6 +2305,7 @@ allocated multiple times.
 		     for objid = nil
 		     when (typep spec 'pdf-obj-ref)
 		     do (setf objid (slot-value spec 'objid))
+		     ;(print fontmap) (terpri)
 		     (setf (gethash font-id fontmap)
 			   (get-font rsrcmgr objid (dict-value spec))))
 	     when (eql k (lit "ColorSpace"))
@@ -2598,7 +2617,7 @@ allocated multiple times.
     (let ((font (gethash fontid fontmap)))
       (if font
 	  (setf (slot-value textstate 'font) font)
-	  (when *strict* (error "Undefined Font id: ~s" fontid)))
+	  (when t (error "Undefined Font id: ~s" fontid)))
       (setf (slot-value textstate 'fontsize) fontsize)))))
 
 (define-ps-function "Tr" (self)
@@ -2703,8 +2722,8 @@ allocated multiple times.
 				  :ctm (mult-matrix matrix ctm))
 		 (device-end-figure device)))
 	      ((and (eql subtype +literal-image+)
-		    (contains (lit "Width") xobj)
-		    (contains (lit "Height") xobj))
+		    (contains xobj (lit "Width"))
+		    (contains xobj (lit "Height")))
 	       (device-begin-figure device (list 0 0 1 1) +matrix-identity+)
 	       (device-render-image device xobj)
 	       (device-end-figure device))
@@ -2792,3 +2811,1119 @@ allocated multiple times.
 	 when (or (not pagenos) (member pageno pagenos))
 	   do (process-page interpreter page)))))
 	   
+(defun get-widths (seq)
+  (loop
+     with widths = (make-hash-table)
+     with r = nil
+     for v in seq
+     if (listp v)
+     do (when r
+	  (let ((char1 (car r)))
+	    (loop for i = 0 then (1+ i)
+	       for w in v
+	       do (setf (gethash (+ char1 i) widths) w))
+	    (setf r nil)))
+     else if (integerp v)
+     do (push v r)
+       (when (= (length r) 3)
+	 (destructuring-bind (w char1 char2)
+	     r
+	   (loop for i from char1 to char2
+		do (setf (gethash i widths) w))
+	   (setf r nil)))
+     finally (return widths)))
+
+(defun get-widths2 (seq)
+  (loop 
+     with widths = (make-hash-table)
+     with r = nil
+     for v in seq
+     if (listp v)
+     do (when r
+	  (let ((char1 (car r)))
+	    (loop for i = 1 then (1+ i)
+	       for (w vx vy . rest) = v then rest
+	       do (setf (Gethash  (1+ char1) widths) `(,w (,vx ,vy)))
+	       when (not rest) return nil)
+	    (setf r nil)))
+     else if (integerp v)
+     do (push v r)
+       (when (= (length r) 5)
+	 (destructuring-bind (vy vx w char2 char1) r
+	   (loop for i from char1 to char2
+	      do (setf (gethash i widths) `(,w (,vx ,vy))))
+	   (setf r nil)))
+       finally (return widths)))
+
+(defun get-font-metrics (fontname)
+  (gethash fontname *font-metrics*))
+
+
+(defparameter +KEYWORD-BEGIN+  (KWD "begin"))
+(defparameter +KEYWORD-END+  (KWD "end"))
+(defparameter +KEYWORD-DEF+  (KWD "def"))
+(defparameter +KEYWORD-PUT+  (KWD "put"))
+(defparameter +KEYWORD-DICT+  (KWD "dict"))
+(defparameter +KEYWORD-ARRAY+  (KWD "array"))
+(defparameter +KEYWORD-READONLY+  (KWD "readonly"))
+(defparameter +KEYWORD-FOR+  (KWD "for"))
+
+(defclass type1-font-header-parser (ps-stack-parser)
+  ((%cid2unicode :initform (make-hash-table))))
+
+(defun make-type1-font-header-parser (data)
+  (make-instance 'type1-font-header-parser :fp data))
+
+(defmethod parser-get-encoding ((self type1-font-header-parser))
+  (with-slots (%cid2unicode) self
+    (loop
+       (destructuring-bind (cid . name)
+	   (handler-case 
+	       (parser-nextobject self)
+	     (ps-eof () (return)))
+	 (handler-case
+	     (setf (gethash cid %cid2unicode)
+		   (encoding-db:name2unicode name))
+	   (key-error () nil))))
+    %cid2unicode))
+
+(defmethod parser-do-keyword ((self type1-font-header-parser) pos token)
+  (when (eql token +keyword-put+)
+    (destructuring-bind
+	  (key value) (mapcar #'cdr (parser-pop self 2))
+      (when (and (integerp key)
+		 (symbolp value)
+		 (eql (symbol-package value) *ps-literal-package*))
+	(parser-add-results self (cons key value))))))
+
+(defparameter +nibbles+ #("0" "1" "2" "3" "4" "5" "6" "7" "8" "9" "." "e" "e-" ""
+ "-"))
+
+(defun getdict (data)
+  (let ((d (make-hash-table))
+	(fp (make-string-input-stream data))
+	(stack nil))
+    (loop
+       for c = (pythonic-read fp 1)
+       until (string= c "")
+       do (let ((b0 (char-code (char c 0))))
+	    (cond
+	      ((<= b0 21)
+	       (setf (gethash b0 d) (nreverse stack)
+		     stack nil))
+	      ((= b0 30)
+	       (let ((s nil)
+		     (loop t))
+		 (loop while loop
+		    for b = (char-code (char (pythonic-read fp 1) 0))
+		    do (loop for n in (list (ash b -4) (logand b 15))
+			  do (if (= n 15)
+				 (setf loop nil)
+				 (str-append s (aref +nibbles+ n)))))
+		 (push (parse-float:parse-float s) stack)))
+	      ((and (<= 32 b0) (<= b0 246))
+	       (push (- b0 139) stack))
+	      (t
+	       (push
+		(let ((b1 (char-code (char (pythonic-read fp 1) 0))))
+		  (cond
+		    ((and (<= 247 b0) (<= b0 250))
+		     (+ (ash (- b0 247) 8) b1 108))
+		    ((and (<= 251 b0) (<= b0 254))
+		     (- 0 (ash (- b0 251) 8) b1 108))
+		    (t
+		     (let ((b2 (char-code (char (pythonic-read fp 1) 0))))
+		       (when (<= 128 b1) (incf b1 (- 256)))
+		       (if (= b0 28)
+			   (logior (ash b1 8) b2)
+			   (logior (ash b1 24)
+				   (ash b2 16)
+				   (ash (char-code (char (pythonic-read fp 1) 0)) 8)
+				   (char-code (char (pythonic-read fp 1) 0))))))))
+		stack)))))
+    d))
+
+(defparameter +standard-strings+
+  (list
+   (lit ".notdef") (lit "space") (lit "exclam") (lit "quotedbl") (lit "numbersign")
+   (lit "dollar") (lit "percent") (lit "ampersand") (lit "quoteright") (lit "parenleft")
+   (lit "parenright") (lit "asterisk") (lit "plus") (lit "comma") (lit "hyphen") (lit "period")
+   (lit "slash") (lit "zero") (lit "one") (lit "two") (lit "three") (lit "four") (lit "five") (lit "six")
+   (lit "seven") (lit "eight") (lit "nine") (lit "colon") (lit "semicolon") (lit "less") (lit "equal")
+   (lit "greater") (lit "question") (lit "at") (lit "A") (lit "B") (lit "C") (lit "D") (lit "E") (lit "F") (lit "G")
+   (lit "H") (lit "I") (lit "J") (lit "K") (lit "L") (lit "M") (lit "N") (lit "O") (lit "P") (lit "Q") (lit "R") (lit "S") (lit "T")
+   (lit "U") (lit "V") (lit "W") (lit "X") (lit "Y") (lit "Z") (lit "bracketleft") (lit "backslash")
+   (lit "bracketright") (lit "asciicircum") (lit "underscore") (lit "quoteleft") (lit "a")
+   (lit "b") (lit "c") (lit "d") (lit "e") (lit "f") (lit "g") (lit "h") (lit "i") (lit "j") (lit "k") (lit "l") (lit "m") (lit "n")
+   (lit "o") (lit "p") (lit "q") (lit "r") (lit "s") (lit "t") (lit "u") (lit "v") (lit "w") (lit "x") (lit "y") (lit "z")
+   (lit "braceleft") (lit "bar") (lit "braceright") (lit "asciitilde") (lit "exclamdown")
+   (lit "cent") (lit "sterling") (lit "fraction") (lit "yen") (lit "florin") (lit "section")
+   (lit "currency") (lit "quotesingle") (lit "quotedblleft") (lit "guillemotleft")
+   (lit "guilsinglleft") (lit "guilsinglright") (lit "fi") (lit "fl") (lit "endash")
+   (lit "dagger") (lit "daggerdbl") (lit "periodcentered") (lit "paragraph") (lit "bullet")
+   (lit "quotesinglbase") (lit "quotedblbase") (lit "quotedblright")
+   (lit "guillemotright") (lit "ellipsis") (lit "perthousand") (lit "questiondown")
+   (lit "grave") (lit "acute") (lit "circumflex") (lit "tilde") (lit "macron") (lit "breve")
+   (lit "dotaccent") (lit "dieresis") (lit "ring") (lit "cedilla") (lit "hungarumlaut")
+   (lit "ogonek") (lit "caron") (lit "emdash") (LIT "AE") (lit "ordfeminine") (lit "Lslash")
+   (lit "Oslash") (LIT "OE") (lit "ordmasculine") (lit "ae") (lit "dotlessi") (lit "lslash")
+   (lit "oslash") (lit "oe") (lit "germandbls") (lit "onesuperior") (lit "logicalnot") (lit "mu")
+   (lit "trademark") (lit "Eth") (lit "onehalf") (lit "plusminus") (lit "Thorn")
+   (lit "onequarter") (lit "divide") (lit "brokenbar") (lit "degree") (lit "thorn")
+   (lit "threequarters") (lit "twosuperior") (lit "registered") (lit "minus") (lit "eth")
+   (lit "multiply") (lit "threesuperior") (lit "copyright") (lit "Aacute")
+   (lit "Acircumflex") (lit "Adieresis") (lit "Agrave") (lit "Aring") (lit "Atilde")
+   (lit "Ccedilla") (lit "Eacute") (lit "Ecircumflex") (lit "Edieresis") (lit "Egrave")
+   (lit "Iacute") (lit "Icircumflex") (lit "Idieresis") (lit "Igrave") (lit "Ntilde")
+   (lit "Oacute") (lit "Ocircumflex") (lit "Odieresis") (lit "Ograve") (lit "Otilde")
+   (lit "Scaron") (lit "Uacute") (lit "Ucircumflex") (lit "Udieresis") (lit "Ugrave")
+   (lit "Yacute") (lit "Ydieresis") (lit "Zcaron") (lit "aacute") (lit "acircumflex")
+   (lit "adieresis") (lit "agrave") (lit "aring") (lit "atilde") (lit "ccedilla") (lit "eacute")
+   (lit "ecircumflex") (lit "edieresis") (lit "egrave") (lit "iacute") (lit "icircumflex")
+   (lit "idieresis") (lit "igrave") (lit "ntilde") (lit "oacute") (lit "ocircumflex")
+   (lit "odieresis") (lit "ograve") (lit "otilde") (lit "scaron") (lit "uacute")
+   (lit "ucircumflex") (lit "udieresis") (lit "ugrave") (lit "yacute") (lit "ydieresis")
+   (lit "zcaron") (lit "exclamsmall") (lit "Hungarumlautsmall") (lit "dollaroldstyle")
+   (lit "dollarsuperior") (lit "ampersandsmall") (lit "Acutesmall")
+   (lit "parenleftsuperior") (lit "parenrightsuperior") (lit "twodotenleader")
+   (lit "onedotenleader") (lit "zerooldstyle") (lit "oneoldstyle") (lit "twooldstyle")
+   (lit "threeoldstyle") (lit "fouroldstyle") (lit "fiveoldstyle") (lit "sixoldstyle")
+   (lit "sevenoldstyle") (lit "eightoldstyle") (lit "nineoldstyle")
+   (lit "commasuperior") (lit "threequartersemdash") (lit "periodsuperior")
+   (lit "questionsmall") (lit "asuperior") (lit "bsuperior") (lit "centsuperior")
+   (lit "dsuperior") (lit "esuperior") (lit "isuperior") (lit "lsuperior") (lit "msuperior")
+   (lit "nsuperior") (lit "osuperior") (lit "rsuperior") (lit "ssuperior") (lit "tsuperior")
+   (lit "ff") (lit "ffi") (lit "ffl") (lit "parenleftinferior") (lit "parenrightinferior")
+   (lit "Circumflexsmall") (lit "hyphensuperior") (lit "Gravesmall") (lit "Asmall")
+   (lit "Bsmall") (lit "Csmall") (lit "Dsmall") (lit "Esmall") (lit "Fsmall") (lit "Gsmall")
+   (lit "Hsmall") (lit "Ismall") (lit "Jsmall") (lit "Ksmall") (lit "Lsmall") (lit "Msmall")
+   (lit "Nsmall") (lit "Osmall") (lit "Psmall") (lit "Qsmall") (lit "Rsmall") (lit "Ssmall")
+   (lit "Tsmall") (lit "Usmall") (lit "Vsmall") (lit "Wsmall") (lit "Xsmall") (lit "Ysmall")
+   (lit "Zsmall") (lit "colonmonetary") (lit "onefitted") (lit "rupiah") (lit "Tildesmall")
+   (lit "exclamdownsmall") (lit "centoldstyle") (lit "Lslashsmall") (lit "Scaronsmall")
+   (lit "Zcaronsmall") (lit "Dieresissmall") (lit "Brevesmall") (lit "Caronsmall")
+   (lit "Dotaccentsmall") (lit "Macronsmall") (lit "figuredash") (lit "hypheninferior")
+   (lit "Ogoneksmall") (lit "Ringsmall") (lit "Cedillasmall") (lit "questiondownsmall")
+   (lit "oneeighth") (lit "threeeighths") (lit "fiveeighths") (lit "seveneighths")
+   (lit "onethird") (lit "twothirds") (lit "zerosuperior") (lit "foursuperior")
+   (lit "fivesuperior") (lit "sixsuperior") (lit "sevensuperior") (lit "eightsuperior")
+   (lit "ninesuperior") (lit "zeroinferior") (lit "oneinferior") (lit "twoinferior")
+   (lit "threeinferior") (lit "fourinferior") (lit "fiveinferior") (lit "sixinferior")
+   (lit "seveninferior") (lit "eightinferior") (lit "nineinferior")
+   (lit "centinferior") (lit "dollarinferior") (lit "periodinferior")
+   (lit "commainferior") (lit "Agravesmall") (lit "Aacutesmall")
+   (lit "Acircumflexsmall") (lit "Atildesmall") (lit "Adieresissmall")
+   (lit "Aringsmall") (lit "AEsmall") (lit "Ccedillasmall") (lit "Egravesmall")
+   (lit "Eacutesmall") (lit "Ecircumflexsmall") (lit "Edieresissmall")
+   (lit "Igravesmall") (lit "Iacutesmall") (lit "Icircumflexsmall")
+   (lit "Idieresissmall") (lit "Ethsmall") (lit "Ntildesmall") (lit "Ogravesmall")
+   (lit "Oacutesmall") (lit "Ocircumflexsmall") (lit "Otildesmall")
+   (lit "Odieresissmall") (lit "OEsmall") (lit "Oslashsmall") (lit "Ugravesmall")
+   (lit "Uacutesmall") (lit "Ucircumflexsmall") (lit "Udieresissmall")
+   (lit "Yacutesmall") (lit "Thornsmall") (lit "Ydieresissmall") (lit "001.000")
+   (lit "001.001") (lit "001.002") (lit "001.003") (lit "Black") (lit "Bold") (lit "Book")
+   (lit "Light") (lit "Medium") (lit "Regular") (lit "Roman") (lit "Semibold")
+   ))
+
+(defun sequence-to-byte-vector (seq &optional (transform #'identity))
+  (let ((a
+	 (make-array (length seq) :element-type '(unsigned-byte 8))))
+    (map-into a transform seq)
+    a))
+
+(defclass font-index ()
+  ((fp :initarg :fp)
+   (offsets :initform nil)
+   base))
+
+(defmethod initialize-instance :after ((self font-index) &rest initargs)
+  (declare (ignorable initargs))
+  (with-slots (fp offsets base) self
+    (let* ((count (nibbles:ub16ref/be
+		   (sequence-to-byte-vector (pythonic-read fp 2) #'char-code) 0))
+	  (offsize (char-code (char (pythonic-read fp 1) 0))))
+      (setf offsets
+	    (loop for i from 0 to count
+	       collect (nunpack (pythonic-read fp offsize))))
+      (setf base (1- (file-position fp)))
+      (file-position fp (+ base (car (last offsets)))))))
+
+(defun make-font-index (fp)
+  (make-instance 'font-index :fp fp))
+
+(defmethod len ((self font-index))
+  (1- (length (slot-value self 'offsets))))
+
+(defmethod getitem ((self font-index) i &optional default)
+  (declare (ignorable default))
+  (with-slots (fp offsets base) self
+      (file-position fp (+ base (nth i offsets)))
+    (pythonic-read fp (- (nth (1+ i) offsets) (nth i offsets)))))
+
+(defmethod iter ((self font-index))
+  (let ((i 0))
+    (lambda ()
+      (when (< i (len self))
+	(getitem self i)))))
+
+(defclass cf-font ()
+  ((name :initarg :name)
+   (fp :initarg :fp)
+   name-index
+   dict-index
+   string-index
+   subr-index
+   top-dict
+   charstring
+   nglyphs
+   (code2gid :initform (make-hash-table))
+   (gid2code :initform (make-hash-table))
+   (name2gid :initform (make-hash-table))
+   (gid2name :initform (make-hash-table))))
+
+(defgeneric getstr (self sid))
+
+(defmethod initialize-instance :after ((self cf-font) &rest initargs)
+  (declare (ignore initargs))
+  (with-slots (fp name name-index dict-index string-index subr-index
+		  top-dict charstring nglyphs code2gid gid2code name2gid gid2name)
+      self
+    (destructuring-bind
+	  (%major %minor hdrsize offsize)
+	(map 'list #'char-code (pythonic-read fp 4))
+	(declare (ignorable %major %minor offsize))
+      (pythonic-read fp (- hdrsize 4))
+      (setf name-index (make-font-index fp)
+	    dict-index (make-font-index fp)
+	    string-index (make-font-index fp)
+	    subr-index (make-font-index fp)
+	    top-dict (getdict (getitem dict-index 0)))
+      (let* ((charset-pos (car (gethash 15 top-dict '(0))))
+	     (encoding-pos (car (gethash 16 top-dict '(0))))
+	     (charstring-pos (car (gethash 17 top-dict '(0)))))
+	(file-position fp charstring-pos)
+	(setf charstring (make-font-index fp)
+	      nglyphs (length charstring))
+	(file-position fp encoding-pos)
+	(let ((format (char-code (char (pythonic-read fp 1) 0))))
+	  (cond
+	    ((= format 0)
+	     (let ((n (char-code (char (pythonic-read fp 1) 0))))
+	       (loop for code from 0 below n
+		    for gid in (map 'list #'char-code (pythonic-read fp n))
+		    do (setf (gethash code code2gid) gid
+			     (gethash gid gid2code) code))))
+	    ((= format 1)
+	     (let* ((n (char-code (char (pythonic-read fp 1) 0)))
+		    (code 0))
+	       (loop for i from 0 below n
+		    for (first nleft) = (map 'list #'char-code (pythonic-read fp 2))
+		    do (loop for gid from first to (+ first nleft)
+			    do
+			    (setf (gethash code code2gid) gid
+				  (gethash gid gid2code) code
+				  code (1+ code))))))
+	    (t
+	     (error "Unsupported encoding format: ~s" format))))
+	(file-position fp charset-pos)
+	(let ((format (char-code (char (pythonic-read fp 1) 0))))
+	  (cond
+	    ((= format 0)
+	     (let* ((n (1- nglyphs))
+		    (unpacked
+		     (loop with raw = (sequence-to-byte-vector
+				       (pythonic-read fp (* 2 n)))
+			  for i from 0 below (* n 2) by 2
+			  collect (nibbles:ub16ref/be raw i))))
+	       (loop for gid from 1 to n
+		  for sid in unpacked
+		    do
+		    (let ((name (getstr self sid)))
+		      (setf (gethash name name2gid) gid
+			    (gethash gid gid2name) name)))))
+	    ((= format 1)
+	     (let* ((n (char-code (char (pythonic-read fp 1) 0)))
+		    (sid 0))
+	       (loop for i from 0 below n
+		    do
+		    (let* ((first (char-code (char (pythonic-read fp 1) 0)))
+			   (nleft  (char-code (char (pythonic-read fp 1) 0))))
+		      (loop for gid from first to (+ first nleft)
+			   do (let ((name (getstr self sid)))
+				(setf (gethash name name2gid) gid
+				      (gethash gid gid2name) name)
+				(incf sid)))))))
+	    ((= format 2)
+	     (assert nil))
+	    (t
+	     (error "Unsupported charset format: ~s" format))))))))
+
+(defun make-cf-font (name fp)
+  (make-instance 'cf-font :name name :fp fp))
+
+(defmethod getstr ((self cf-font) sid)
+  (if (< sid (length +standard-strings+))
+      (nth sid +standard-strings+)
+      (getitem (slot-value self 'string-index)
+	       (- sid (length +standard-strings+)))))
+
+(defclass true-type-font ()
+  ((name :initarg :name)
+   (fp :initarg :fp)
+   (tables :initform (make-hash-table))
+   fonttype))
+
+(defmethod initialize-instance :after ((self true-type-font) &rest initargs)
+  (declare (ignore initargs))
+  (with-slots (name fp tables fonttype) self
+    (setf fonttype (pythonic-read fp 4))
+    (let ((ntables
+	   (nibbles:ub16ref/be
+	    (sequence-to-byte-vector (pythonic-read fp 8) #'char-code) 0)))
+      (loop for i from 1 to ntables
+	   do
+	   (let*
+	       ((name (litf (pythonic-read fp 4)))
+		(tsum (nibbles:ub32ref/be
+		       (sequence-to-byte-vector (pythonic-read fp 4) #'char-code) 0))
+		(offset (nibbles:ub32ref/be
+		       (sequence-to-byte-vector (pythonic-read fp 4) #'char-code) 0))
+		(length (nibbles:ub32ref/be
+		       (sequence-to-byte-vector (pythonic-read fp 4) #'char-code) 0)))
+	     (declare (ignore tsum))
+	     (setf (gethash name tables) (cons offset length)))))))
+
+(defun make-true-type-font (name fp)
+  (make-instance 'true-type-font :fp fp :name name))
+
+(defun bytes-to-half-words (array &optional signed)
+  (loop for i from 0 below (length array) by 2
+     collect (if signed
+		 (nibbles:sb16ref/be array i)
+		 (nibbles:ub16ref/be array i))))
+
+(defun pythonic-read-half-word (fp &optional signed)
+  (if signed
+      (nibbles:sb16ref/be (sequence-to-byte-vector (pythonic-read fp 2) #'char-code) 0)
+      (nibbles:ub16ref/be (sequence-to-byte-vector (pythonic-read fp 2) #'char-code) 0)))
+
+(defmethod create-unicode-map ((self true-type-font))
+  (with-slots (tables fp) self
+    (when (not (in-dict (lit "cmap") tables))
+      (error "CMap Not Found"))
+    (let ((base-offset (car (gethash (lit "cmap") tables))))
+      (file-position fp base-offset)
+      (let*
+	  ((version 
+	    (nibbles:ub16ref/be (sequence-to-byte-vector (pythonic-read fp 2) #'char-code) 0))
+	   (nsubtables
+	    (nibbles:ub16ref/be (sequence-to-byte-vector (pythonic-read fp 2) #'char-code) 0))
+	   (subtables
+	    (loop for i from 1 to nsubtables
+	       collect
+		 (list
+		  (nibbles:ub16ref/be
+		   (sequence-to-byte-vector (pythonic-read fp 2) #'char-code) 0)
+		  (nibbles:ub16ref/be
+		   (sequence-to-byte-vector (pythonic-read fp 2) #'char-code) 0)
+		  (nibbles:ub32ref/be
+		   (sequence-to-byte-vector (pythonic-read fp 4) #'char-code) 0))))
+	   (char2gid (make-hash-table)))
+	   (declare (ignore version))
+	(loop
+	     for (_ __ st-offset) in subtables
+	     do
+	     (file-position fp (+ base-offset st-offset))
+	     (let*
+		 ((fmttype
+		   (nibbles:ub16ref/be
+		    (sequence-to-byte-vector (pythonic-read fp 6) #'char-code) 0)))
+	       (cond
+		 ((= fmttype 0)
+		  (loop
+		       for i from 0 below 256
+		       for b = (char-code (char (pythonic-read fp 1) 0))
+		       do (setf (gethash i char2gid) b)))
+		 ((= fmttype 2)
+		  (let
+		      ((subheaderkeys
+			(loop with raw = (sequence-to-byte-vector
+					  (pythonic-read fp 512))
+			   for i from 0 below 512 by 2
+			   collect (nibbles:ub16ref/be raw i)))
+		       (firstbytes (make-array 8192 :initial-element 0)))
+		    (loop for i from 0 below (length subheaderkeys)
+			 for k in subheaderkeys
+			 do (setf (aref firstbytes (truncate k 8)) i))
+		    (let* ((nhdrs
+			    (1+ (truncate (reduce #'max subheaderkeys) 8)))
+			   (hdrs
+			    (loop for i from 0 below nhdrs
+				 collect
+				 (let* ((firstcode
+					  (nibbles:ub16ref/be
+					   (sequence-to-byte-vector
+					    (pythonic-read fp 2) #'char-code) 0))
+					(entcount
+					  (nibbles:ub16ref/be
+					   (sequence-to-byte-vector
+					    (pythonic-read fp 2) #'char-code) 0))
+					(delta
+					  (nibbles:sb16ref/be
+					   (sequence-to-byte-vector
+					    (pythonic-read fp 2) #'char-code) 0))
+					(offset
+					  (nibbles:ub16ref/be
+					   (sequence-to-byte-vector
+					    (pythonic-read fp 2) #'char-code) 0)))
+				   (list i
+					 firstcode
+					 entcount
+					 delta
+					 (+ (file-position fp) -2 offset))))))
+		      (loop for (i firstcode entcount delta pos) in hdrs
+			   when (/= 0 entcount)
+			   do
+			   (let ((first (+ firstcode (ash (aref firstbytes i) 8))))
+			     (file-position fp pos)
+			     (loop for c from 0 below entcount
+				for gid =(nibbles:ub16ref/be
+					  (sequence-to-byte-vector
+					   (pythonic-read fp 2) #'char-code) 0) 
+				  do (setf
+				   (gethash (+ first c) char2gid)
+				   (if (/= gid 0)
+				       (+ gid delta)
+				       gid))))))))
+		 ((= fmttype 4)
+		  (let* ((segcount
+			  (nibbles:ub16ref/be (sequence-to-byte-vector
+					       (pythonic-read fp 8) #'char-code) 0))
+			 (ecs
+			  (bytes-to-half-words (sequence-to-byte-vector
+						(pythonic-read fp segcount) #'char-code)))
+			 (_ (pythonic-read fp 2))
+			 (scs
+			  (bytes-to-half-words (sequence-to-byte-vector
+						(pythonic-read fp segcount) #'char-code)))
+			 (idds
+			  (bytes-to-half-words (sequence-to-byte-vector
+						(pythonic-read fp segcount) #'char-code)
+					       t))
+			 (pos (file-position fp))
+			 (idrs
+			  (bytes-to-half-words (sequence-to-byte-vector
+						(pythonic-read fp segcount) #'char-code))))
+		    (declare (ignore _))
+		    (loop for ec in ecs
+			 for sc in scs
+			 for idd in idds
+			 for idr in idrs
+			 if (/= idr 0)
+			 do
+			 (file-position fp (+ pos idr))
+			 (loop for c from sc to ec
+			      do (setf (gethash c char2gid)
+				    (logand
+				     #xffff
+				     (+
+				      (pythonic-read-half-word fp)
+				      idd))))
+			 else
+			 do (loop for c from sc to ec
+			      do (setf (gethash c char2gid)
+				    (logand #xffff (+ c idd)))))))
+		 (t
+		  (assert nil)))
+	       (let  ((unicode-map (make-file-unicode-map)))
+		 (loop for char being the hash-keys of char2gid
+		      using (hash-value gid)
+		      do (add-cid2unichr unicode-map gid char))
+		 unicode-map)))))))
+
+(defparameter +literal-standard-encoding+ (lit "StandardEncoding"))
+(defparameter +literal-type1c+ (lit "Type1C"))
+
+(defclass pdf-font ()
+    ((descriptor :initarg :descriptor)
+     (widths :initarg :widths)
+     fontname
+     flags
+     ascent
+     descent
+     italic-angle
+     (default-width :initarg :default-width
+       :initform nil)
+     leading
+     bbox
+     (hscale :initform 0.001d0)
+     (vscale :initform 0.001d0)))
+
+
+(defun initialize-pdf-font (self %descriptor %widths &optional %default-width)
+  (with-slots (fontname descriptor flags ascent descent italic-angle
+			default-width leading bbox hscale widths)
+      self
+    (setf descriptor %descriptor
+	  widths %widths
+	  default-width %default-width
+	  fontname (resolve1 (gethash (lit "FontName") descriptor (lit "unknown")))
+	  flags (int-value (gethash (lit "Flags") descriptor 0))
+	  ascent (num-value (gethash (lit "Ascent") descriptor 0))
+	  descent (num-value (gethash (lit "Descent") descriptor 0))
+	  italic-angle (num-value (gethash (lit "ItalicAngle") descriptor 0))
+	  default-width (or default-width
+			    (num-value (gethash (lit "MissingWidth") descriptor 0)))
+	  leading (num-value (gethash (lit "Leading") descriptor 0))
+	  bbox (list-value (gethash (lit "FontBBox") descriptor (list 0 0 0 0)))))
+  self)
+
+(defun make-pdf-font  (descriptor widths &optional default-width)
+  (let ((font (make-instance 'pdf-font)))
+    (initialize-pdf-font font descriptor widths default-width)
+    font))
+
+(defmethod is-vertical ((self pdf-font)) nil)
+(defmethod is-multibyte ((self pdf-font)) nil)
+
+(defgeneric font-decode (self bytes))
+(defmethod font-decode ((self pdf-font) bytes)
+  (map 'list #'char-code bytes))
+
+(defmethod get-ascent ((self pdf-font))
+  (with-slots (ascent vscale) self
+    (* ascent vscale)))
+
+(defmethod get-descent ((self pdf-font))
+  (with-slots (descent vscale) self
+    (* descent vscale)))
+
+(defmethod get-width ((self pdf-font))
+  (with-slots (bbox default-width hscale) self
+    (let ((w (- (nth 2 bbox) (nth 0 bbox))))
+      (if (= w 0)
+	  (* hscale (- default-width))
+	  (* w hscale)))))
+
+(defmethod get-height ((self pdf-font))
+  (with-slots (bbox ascent descent vscale) self
+    (let ((h (- (nth 3 bbox) (nth 1 bbox))))
+      (if (= h 0)
+	  (* vscale (- ascent descent))
+	  (* h vscale)))))
+
+(defgeneric char-width (self cid))
+(defmethod char-width ((self pdf-font) cid)
+  (with-slots (widths default-width hscale) self
+    (* (gethash cid widths  default-width) hscale)))
+
+(defmethod char-disp ((self pdf-font) cid) 0)
+
+(defmethod string-width ((self pdf-font) s)
+  (loop for cid in (font-decode self s)
+       sum (char-width self cid)))
+
+(defclass pdf-simple-font (pdf-font)
+  ((unicode-map :initform nil)
+   cid2unicode))
+
+(defun initialize-pdf-simple-font (self descriptor widths spec)
+  (with-slots (cid2unicode unicode-map) self
+  (let*
+      ((encoding
+	(if (in-dict (lit "Encoding") spec)
+	    (resolve1 (gethash (lit "Encoding") spec))
+	    +literal-standard-encoding+)))
+    (setf cid2unicode
+	  (if (hash-table-p encoding)
+	      (encoding-db:get-encoding
+	       (gethash (lit "BaseEncoding") encoding +literal-standard-encoding+)
+	       (list-value (gethash (lit "Differences") encoding)))
+	      (encoding-db:get-encoding encoding)))
+    (when (in-dict (lit "ToUnicode") spec)
+      (let ((stream (stream-value (gethash (lit "ToUnicode") spec))))
+	(setf unicode-map (make-file-unicode-map))
+	(parser-run
+	 (make-cmap-parser unicode-map (make-string-input-stream (get-data stream))))))
+    (initialize-pdf-font self descriptor widths))))
+
+(defun make-pdf-simple-font (descriptor widths spec)
+  (let ((font (make-instance 'pdf-simple-font)))
+    (initialize-pdf-simple-font font descriptor widths spec)
+    font))
+
+(defmethod to-unichr ((self pdf-simple-font) cid)
+  (with-slots (unicode-map cid2unicode) self
+    ;(break)
+    (when unicode-map
+      (let ((unich (get-unichar unicode-map cid)))
+	(or unich
+	    (handler-case
+		(gethash cid cid2unicode)
+	      (key-error () (error "PDF Unicode Not Defined ~S" cid))))))))
+
+
+(defclass pdf-type1-font (pdf-simple-font)
+  (basefont
+   fontfile))
+
+(defun initialize-pdf-type1-font (self rsrcmgr spec)
+  (declare (ignorable rsrcmgr))
+  (with-slots (basefont cid2unicode fontfile) self
+    (setf basefont
+	  (or
+	   (gethash (lit "BaseFont") spec)
+	   (if *strict*
+	       (error "BaseFont is missing")
+	       (lit "unknown"))))
+    (destructuring-bind (descriptor widths)
+	(or
+	 (get-font-metrics basefont)
+	 (list
+	  (dict-value (gethash (lit "FontDescriptor") spec (make-hash-table)))
+	  (let* ((firstchar (int-value (gethash (lit "FirstChar") spec 0)))
+		 (widths (list-value (gethash (lit "Widths") spec (make-list 256 :initial-element 0)))))
+	    (alist-hash-table
+	     (loop for i = firstchar then (1+ i)
+		for w in widths
+		collect (cons i w))))))
+      (initialize-pdf-simple-font self descriptor widths spec)
+      (when
+	  (and (not (in-dict (lit "Encoding") spec))
+	       (in-dict (lit "FontFile") descriptor))
+	(setf fontfile (stream-value (gethash (lit "FontFile") descriptor)))
+	(let*
+	    ((length1 (int-value (getitem fontfile (lit "Length1"))))
+	     (data (subseq (get-data fontfile) 0 length1))
+	     (parser (make-type1-font-header-parser data)))
+	  (setf cid2unicode (parser-get-encoding parser)))))))
+
+(defun make-pdf-type1-font (rsrcmgr spec)
+  (let ((font (make-instance 'pdf-type1-font)))
+    (initialize-pdf-type1-font font rsrcmgr spec)
+    font))
+
+(defclass pdf-true-type-font (pdf-type1-font) ())
+
+(defun make-pdf-true-type-font (rsrcmgr spec)
+  (let ((font (make-instance 'pdf-true-type-font)))
+    (initialize-pdf-type1-font font rsrcmgr spec)
+    font))
+  
+(defclass pdf-type3-font (pdf-simple-font) (matrix))
+
+(defun initialize-pdf-type3-font (self rsrcmgr spec)
+  (declare (ignore rsrcmgr))
+  (with-slots (matrix descent ascent bbox hscale vscale) self
+    (let* ((firstchar (int-value (gethash (lit "FirstChar") spec 0)))
+	   #+(or)(lastchar (int-value (gethash (lit "LastChar") spec 0)))
+	   (widths (list-value (gethash (lit "Widths") spec
+					(make-list 256 :initial-element 0))))
+	   (widths
+	    (loop with ht = (make-hash-table)
+		 for i = firstchar then (1+ i)
+		 for w in widths
+		 do (setf (gethash i ht) w)
+		 finally (return ht)))
+	   (descriptor
+	    (or
+	     (gethash (lit "FontDescriptor") spec)
+	     (plist-alist
+	      `(,(lit "Ascent") 0 ,(lit "Descent") 0
+		 ,(lit "FontBBox") ,(gethash (lit "FontBBox") spec))))))
+      (initialize-pdf-simple-font self descriptor widths spec)
+      (setf
+       matrix (list-value (gethash (lit "FontMatrix") spec))
+       descent (second bbox)
+       ascent (fourth bbox))
+      (let ((norm (apply-matrix-norm matrix (list 1 1))))
+	(setf hscale (first norm)
+	      vscale (second norm)))))
+  self)
+
+(defun make-pdf-type3-font (rsrcmgr spec)
+  (let ((font (make-instance 'pdf-type3-font)))
+    (initialize-pdf-type3-font font rsrcmgr spec)
+    font))
+
+(defclass pdf-cid-font (pdf-font)
+  (basefont cidsysteminfo cidcoding cmap fontfile unicode-map
+	    default-disp vertical disps))
+
+(defun initialize-pdf-cid-font (self rsrcmgr spec)
+  (declare (ignore rsrcmgr)
+	   (type pdf-cid-font self))
+  (with-slots (basefont cidsysteminfo cidcoding cmap fontfile unicode-map vertical
+			default-disp) self
+    (setf basefont (gethash (lit "BaseFont") spec)
+	  unicode-map nil)
+    (unless basefont
+      (if *strict*
+	  (error "BaseFont is missing")
+	  (setf basefont (lit "unknown"))))
+    (setf
+     cidsysteminfo (dict-value (gethash (lit "CIDSystemInfo") spec (make-hash-table)))
+     cidcoding (litf (format nil "~A-~A"
+			     (gethash (lit "Registry") cidsysteminfo (lit "unknown"))
+			     (gethash (lit "Ordering") cidsysteminfo (lit "unknown")))))
+    ;;(format t "cidcoding: ~s~%" cidcoding)
+    (let ((name
+	   (or (gethash (lit "Encoding") spec)
+	       (if *strict* (error "Encoding is unspecified") (lit "unknown")))))
+      (setf cmap
+	    (handler-case (get-cmap name)
+	      (cmap-not-found ()
+		(if *strict* (error "CMap Not Found")
+		    (make-cmap)))))
+      (let ((descriptor
+	     (let ((d (dict-value (gethash (lit "FontDescriptor") spec))))
+	       (if (= 0 (hash-table-count d))
+		   (if *strict*
+		       (error "FontDescriptor is missing")
+		       (make-hash-table))
+		   d)))
+	    (ttf nil))
+	(when (in-dict (lit "FontFile2") descriptor)
+	  (setf fontfile (stream-value (gethash (lit "FontFile2") descriptor))
+		ttf (make-true-type-font basefont (make-string-input-stream
+						   (get-data fontfile)))))
+	;(format t "ttf: ~s~%" ttf)
+	;(format t "touni: ~s" (gethash (lit "ToUnicode") spec))
+
+	(cond
+	  ((in-dict (lit "ToUnicode") spec)
+	   (let ((strm (stream-value (gethash (lit "ToUnicode") spec))))
+	     (setf unicode-map (make-file-unicode-map))
+	     (parser-run
+	      (make-cmap-parser unicode-map (make-string-input-stream (get-data strm))))))
+	  ((eql cidcoding (lit "Adobe-Identity"))
+	   (when ttf
+	     (handler-case
+		 (setf unicode-map (create-unicode-map ttf))
+	       (cmap-not-found () nil))))
+	  (t
+	   (handler-case
+	       (setf unicode-map (get-unicode-map cidcoding (is-vertical cmap)))
+	     (cmap-not-found () nil))))
+	(setf vertical (is-vertical cmap))
+	(let*
+	    ((widths (if vertical
+			 (get-widths2 (list-value (gethash (lit "W2") spec nil)))
+			 (get-widths (list-value (gethash (lit "W") spec nil)))))
+	     (disps (if vertical
+			(alist-hash-table
+			 (loop for (_ (vx vy)) being the hash-values of widths
+			    using (hash-key cid)
+			    collect (cons cid (list vx vy))))
+			(make-hash-table)))
+	     (vyw (gethash (lit "DW2") spec (list 880 -1000)))
+	     (vy (first vyw))
+	     (w (second vyw))
+	     (widths
+	      (if vertical
+		  (loop with ht = (make-hash-table)
+		     for (w _) being the hash-values of widths
+		     using (hash-key cid)
+		     do (setf (gethash cid ht) w)
+		     finally (return ht))
+		  (get-widths (list-value (gethash (lit "W") spec nil)))))
+	     (default-width
+	      (if vertical
+		  w
+		  (gethash (lit "DW") spec 1000))))
+	  (setf (slot-value self 'disps) disps
+		default-disp (if vertical (list nil vy) 0))
+	  (initialize-pdf-font self descriptor widths default-width)))))
+  self)
+
+(defun make-pdf-cid-font (rsrcmgr spec)
+  (initialize-pdf-cid-font (make-instance 'pdf-cid-font) rsrcmgr spec))
+
+(defmethod is-vertical ((self pdf-cid-font))
+  (slot-value self 'vertical))
+
+(defmethod is-multibyte ((self pdf-cid-font))
+  t)
+
+(defmethod font-decode ((self pdf-cid-font) bytes)
+  (cmap-decode (slot-value self 'cmap) bytes))
+
+(defmethod char-disp ((self pdf-cid-font) cid)
+  (with-slots (disps default-disp) self
+    (gethash cid disps default-disp)))
+
+(defmethod to-unichr ((self pdf-cid-font) cid)
+  (with-slots (unicode-map cidcoding) self
+    ;(break)
+    (handler-case
+	(if unicode-map
+	    (get-unichar unicode-map cid)
+	    (error (make-condition 'key-error)))
+      (key-error () (error "Unicode Not Defined: ~s" cidcoding)))))
+	     
+(defparameter *cmap-debug* 0)
+(defclass cmap ()
+  (code2cid))
+
+(defun initialize-cmap (self &optional code2cid)
+  (setf (slot-value self 'code2cid)
+	(or
+	 code2cid
+	 (make-hash-table)))
+  self)
+
+(defun make-cmap (&optional code2cid)
+  (initialize-cmap (make-instance 'cmap) code2cid))
+
+(defmethod is-vertical ((self cmap)) nil)
+
+(defmethod use-cmap ((self cmap) other)
+  (assert (typep other 'cmap))
+  (labels ((copy (dst src)
+	   (loop for k being the hash-keys of src
+		using (hash-value v)
+		do (if (hash-table-p v)
+		    (let ((d (make-hash-table)))
+		      (setf (gethash k dst) d)
+		      (copy d v))
+		    (setf (gethash k dst) v)))))
+    (copy (slot-value self 'code2cid)
+	  (slot-value other 'code2cid))))
+
+(defmethod cmap-decode ((self cmap) code)
+  (when (/= 0 *cmap-debug*)
+    (format *error-output* "~&decode: ~s ~s~%" self code))
+  (loop with d = (slot-value self 'code2cid)
+       for char across code
+       for c = (char-code char)
+       do (setf d (gethash c d))
+       when (integerp d) collect d and do (setf d (slot-value self 'code2cid))
+       unless d do (setf d (slot-value self 'code2cid))))
+
+;(defmethod dump ((self cmap) &key (out *standard-output*) code2cid code)
+
+(defclass identity-cmap ()
+  ((vertical :initarg :vertical)))
+
+(defun make-identity-cmap (vertical)
+  (make-instance 'identity-cmap :vertical vertical))
+
+(defmethod is-vertical ((self identity-cmap))
+  (slot-value self 'vertical))
+
+(defmethod cmap-decode ((self identity-cmap) code)
+       (let ((code (map 'list #'char-code code)))
+  (loop
+     for (a b . rest) = code then rest
+       collect (logior (ash a 8) b)
+       while rest)))
+
+(defclass unicode-map ()
+  (cid2unichr))
+
+(defun initialize-unicode-map (self &optional cid2unichr)
+  (setf (slot-value self 'cid2unichr)
+	(or cid2unichr (make-hash-table)))
+  self)
+
+(defun make-unicode-map (cid2unichr)
+  (initialize-unicode-map (make-instance 'unicode-map) cid2unichr))
+(defmethod get-unichar ((self unicode-map) cid)
+  (or
+   (gethash cid (slot-value self 'cid2unichr))
+   ;(format t "cid2unichr: ~S" (hash-table-alist (slot-value self 'cid2unichr)))
+   (error (make-condition 'key-error))))
+
+(defclass file-cmap (cmap)
+  (attrs))
+
+(defun initialize-file-cmap (self)
+  (initialize-cmap self)
+  (setf (slot-value self 'attrs) (make-hash-table))
+  self)
+
+(defun make-file-cmap ()
+  (initialize-file-cmap (make-instance 'file-cmap)))
+
+(defmethod is-vertical ((self file-cmap))
+  (/= 0 (gethash (lit "WMode") (slot-value self 'attrs) 0)))
+
+(defmethod set-attr ((self file-cmap) k v)
+  (setf (gethash k (slot-value self 'attrs)) v))
+
+(defmethod add-code2cid ((self file-cmap) code cid)
+  (let ((code (if (symbolp code) (symbol-name code) code)))
+    (assert (and (stringp code) (integerp cid)))
+    (loop
+       with d = (slot-value self 'code2cid)
+       for char across (subseq code (1- (length code)))
+       for c = (char-code char)
+       unless (in-dict c d) do (setf (gethash c d) (make-hash-table))
+       do (setf d (gethash c d))
+       finally (setf (gethash (char code (1- (length char))) d) cid))))
+
+(defclass file-unicode-map (unicode-map)
+  (attrs))
+
+(defun initialize-file-unicode-map (self)
+  (initialize-unicode-map self)
+  (setf (slot-value self 'attrs) (make-hash-table))
+  self)
+
+(defun make-file-unicode-map ()
+  (initialize-file-unicode-map (make-instance 'file-unicode-map)))
+
+(defmethod set-attr ((self file-unicode-map) k v)
+  (setf (gethash k (slot-value self 'attrs)) v))
+
+(defmethod add-cid2unichr ((self file-unicode-map) cid code)
+  (assert (integerp cid))
+  (with-slots (cid2unichr) self
+    (etypecase code
+      (symbol
+       (setf (gethash cid cid2unichr) (encoding-db:name2unicode code)))
+      (string
+       (setf (gethash cid cid2unichr)
+	     (babel:octets-to-string
+	      (map '(vector (unsigned-byte 8)) #'char-code code)
+	      :encoding :utf-16be)))
+      (integer
+       (setf (gethash cid cid2unichr) code)))))
+
+;(defclass pycmap (cmap))
+;(defclass py-unicode-map (cmap))
+
+(defun get-cmap (name)
+  (cond
+  ((eql name (lit "Identity-H")) (make-identity-cmap nil))
+  ((eql name (lit "Identity-V")) (make-identity-cmap t))
+  (t (error (make-condition 'cmap-not-found)))))
+
+(defun get-unicode-map (name &optional vertical)
+  (declare (ignorable name vertical))
+  (error (make-condition 'cmap-not-found)))
+
+(defclass cmap-parser (ps-stack-parser)
+  ((cmap :initarg :cmap)
+   (%in-cmap :initform nil)))
+
+(defun make-cmap-parser (cmap fp)
+  (make-instance 'cmap-parser :cmap cmap :fp fp))
+
+(defmethod parser-run ((self cmap-parser))
+  (handler-case
+      (parser-nextobject self)
+    (ps-eof () nil)))
+
+(defmethod parser-do-keyword ((self cmap-parser) pos token)
+  (with-slots (%in-cmap cmap) self
+  ;(format t "p-d-k cmap ~a ~s~%" %in-cmap token)
+  (cond
+    ((eql token (kwd "begincmap"))
+     (setf %in-cmap t)
+     (parser-popall self))
+    ((eql token (kwd "endcmap"))
+     (setf %in-cmap nil))
+    ((not %in-cmap) nil)
+    (t
+     (case token
+       (#.(kwd "def")
+	(handler-case
+	    (destructuring-bind
+		  (k v) (parser-pop self 2)
+	      (set-attr cmap (cdr k) (cdr v)))
+	  (ps-syntax-error () nil)))
+       (#.(kwd "usecmap")
+	(handler-case
+	    (let ((cmapname (cddr (parser-pop self 1))))
+	      (use-cmap cmap (get-cmap cmapname)))
+	  (ps-syntax-error () nil)
+	  (cmap-not-found () nil)))
+       ((ps-keyword::|begincodespacerange|
+	 ps-keyword::|endcodespacerange|
+	 ps-keyword::|begincidrange|
+	 ps-keyword::|begincidchar|
+	 ps-keyword::|beginbfrange|
+	 ps-keyword::|beginbfchar|
+	 ps-keyword::|beginnotdefrange|
+	 ps-keyword::|endnotdefrange|
+	 )
+	(parser-popall self))
+       (#.(kwd "endcidrange")
+	(let ((objs (mapcar #'cdr (parser-popall self))))
+	  (loop for (s e cid . rest) = objs then rest
+	     when (and (stringp s) (stringp e) (integerp cid)
+		       (= (length s) (length e)))
+	     do
+	       (let* ((splitpos (max 0 (- (length s) 4)))
+		      (sprefix (subseq s splitpos))
+		      (eprefix (subseq e splitpos)))
+		 (when (string= sprefix eprefix)
+		   (let* ((svar (subseq s splitpos))
+			  (evar (subseq e splitpos))
+			  (s1 (nunpack svar))
+			  (e1 (nunpack evar))
+			  (vlen (length svar)))
+		     (loop for i from 0 to (- e1 s1)
+			for x =
+			  (concatenate 'string
+				       sprefix
+				       (subseq 
+					(map 'string #'code-char (make-be-uint32 (+ s1 i)))
+					(max 0 (- 4 vlen))))
+			do (add-code2cid cmap x (+ cid i))))))
+	       while rest)))
+       (#.(kwd "endcidchar")
+	(let ((objs (mapcar #'cdr (parser-popall self))))
+	  (loop for (cid code . rest) = objs then rest
+	       when (and (stringp code) (stringp cid))
+	       do (add-code2cid cmap code (nunpack cid))
+	       while rest)))
+       (#.(kwd "endbfrange")
+	(let ((objs (mapcar #'cdr (parser-popall self))))
+	  (loop for (s e code . rest) = objs then rest
+	     when (and (stringp s) (stringp e) (= (length s) (length e)))
+	       do (let
+		      ((s1 (nunpack s))
+		       (e1 (nunpack 3)))
+		    (if (listp code)
+			(loop for i from s1 to e1
+			   for c in code
+			     do (add-cid2unichr cmap i c))
+			(loop
+			   with split = (max 0 (- (length code) 4))
+			   with var = (subseq code split)
+			   with base = (nunpack var)
+			   with prefix = (subseq code 0 split)
+			   with vlen = (length var)
+			   for i from s1 to e1
+			   for c = base then (1+ c)
+			   for x =
+			     (concatenate 'string
+					  prefix
+					  (subseq 
+					   (map 'string #'code-char (make-be-uint32 c))
+					   (max 0 (- 4 vlen))))
+			   do (add-cid2unichr cmap i x))))
+	     while rest)))
+       (#.(kwd "endbfchar")
+	(let ((objs (mapcar #'cdr (parser-popall self))))
+	  ;(format *error-output* "~s~%" objs)
+	  (loop for (cid code . rest) = objs then rest
+	     when (and (stringp cid) (stringp code))
+	       do (add-cid2unichr cmap (nunpack cid) code)
+	     while rest)))
+       (t (parser-push self (cons pos token))))))))
+	
+       
+	  
+	       
+	
+
+			  
+		   
+
+
+;   Undefined functions:
+;     ADD-CID2UNICHR CMAP-PARSER-RUN GET-UNICHAR MAKE-CMAP-PARSER MAKE-FILE-UNICODE-MAP NAME2UNICODE
+		

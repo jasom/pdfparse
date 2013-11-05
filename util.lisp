@@ -46,7 +46,7 @@
 
 (defun kwd (name) (intern name *ps-keyword-package*))
 
-(defvar *strict* nil)
+(defvar *strict* t)
 
 (defparameter +keyword-proc-begin+ (kwd "{"))
 (defparameter +keyword-proc-end+ (kwd "}"))
@@ -62,6 +62,13 @@
       (list (+ (* a0 a1) (* c0 b1))     (+ (* b0 a1) (* d0 b1))
 	    (+ (* a0 c1) (* c0 d1))     (+ (* b0 c1) (* d0 d1))
 	    (+ (* a0 e1) (* c0 f1) e0)  (+ (* b0 e1) (* d0 f1) f0))))
+
+(defun apply-matrix-norm (mt norm)
+  (destructuring-bind (a b c d e f) mt
+    (declare (ignore e f))
+    (destructuring-bind (p q) norm
+      (list (+ (* a p) (* c q))
+	    (+ (* b p) (* d q))))))
 
 (define-condition ps-eof (error) ())
 (define-condition ps-type-error (error) ())

@@ -16,15 +16,17 @@
   (format stream "#<PDF-COLOR-SPACE ~s ncomponents=~d>"  name ncomponents)))
 
 (defparameter +predefined-colorspace+
-  (plist-hash-table
-   (list
-    (lit "CalRGB") 3
-    (lit "CalGray") 1
-    (lit "Lab") 3
-    (lit "DeviceRGB") 3
-    (lit "DeviceCMYK") 4
-    (lit "DeviceGray") 1
-    (lit "Separation") 1
-    (lit "Indexed") 1
-    (lit "Pattern") 1)))
+  (alist-hash-table
+   (mapcar (lambda (x)
+	     (cons (car x) (make-pdf-color-space (car x) (cdr x))))
+	   (list
+	    (cons (lit "CalRGB") 3)
+	    (cons (lit "CalGray") 1)
+	    (cons (lit "Lab") 3)
+	    (cons (lit "DeviceRGB") 3)
+	    (cons (lit "DeviceCMYK") 4)
+	    (cons (lit "DeviceGray") 1)
+	    (cons (lit "Separation") 1)
+	    (cons (lit "Indexed") 1)
+	    (cons (lit "Pattern") 1)))))
   

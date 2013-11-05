@@ -10,14 +10,18 @@
                #:babel
 	       #:parse-float
 	       #:flexi-streams
+	       #:nibbles
 	       #:deflate
 	       #:cl-ppcre
 	       #:ironclad)
   :components ((:file "package")
 	       (:file "util")
+	       (:file "metrics")
 	       (:file "stubs")
 	       (:file "device")
+	       (:file "glyphlist")
+	       (:file "encodingdb")
 	       (:file "pdfcolor")
                (:file "pdfparse")
-	       (:file "cmap")))
+	       ))
 

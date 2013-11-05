@@ -20,6 +20,6 @@
   (:export :kwd :lit :ps-base-parser :parser-nexttoken :ps-eof :ps-stack-parser
 	   :parser-nextobject))
 
-(defpackage #:cmap
-  (:use #:cl)
-  (:export #:get-cmap #:cmap #:cmap-not-found))
+(defpackage #:encoding-db
+  (:use #:cl #:pdfparse)
+  (:export :get-encoding :name2unicode))
