@@ -1131,7 +1131,7 @@ This procedure might be slow."
 	(progn
 	  (setf kwd (cdr (parser-nexttoken parser))
 		dic (cdr (parser-nextobject parser)))
-	  (format *error-output* "Trailer: ~s~%" (hash-table-alist dic))
+	  ;(format *error-output* "Trailer: ~s~%" (hash-table-alist dic))
 	  (assert (eql kwd +keyword-trailer+)))
       (ps-eof ()
 	  (let ((x (parser-pop parser 1)))
@@ -1139,7 +1139,7 @@ This procedure might be slow."
 	      (error (make-condition 'pdf-no-valid-xref "Unexpected EOF - file corrupted")))
 	    (setf dic (car x)))))
     (let ((dic (dict-value dic)))
-	(format *error-output* "Trailer: ~s~%" (hash-table-alist dic))
+	;(format *error-output* "Trailer: ~s~%" (hash-table-alist dic))
       (loop
 	 for k being the hash-key of dic
 	 using (hash-value v)
@@ -2706,11 +2706,11 @@ allocated multiple times.
 	  (let ((subtype (getitem xobj (lit "Subtype"))))
 	    (cond
 	      ((and (eql subtype +literal-form+)
-		    (in-dict (lit "BBox") xobj))
+		    (getitem xobj (lit "BBox")))
 	       (let* ((interpreter (dup self))
-		      (bbox (list-value (gethash (lit "BBox") xobj)))
-		      (matrix (list-value (gethash (lit "Matrix") xobj +matrix-identity+)))
-		      (resources (dict-value (gethash (lit "Resources") xobj)))
+		      (bbox (list-value (getitem xobj (lit "BBox") )))
+		      (matrix (list-value (getitem xobj (lit "Matrix")  +matrix-identity+)))
+		      (resources (dict-value (getitem xobj (lit "Resources") )))
 		      (resources (if (> (hash-table-count resources) 0)
 				     resources
 				     (copy-hash-table (slot-value self 'resources)))))

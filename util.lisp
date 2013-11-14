@@ -70,6 +70,11 @@
       (list (+ (* a p) (* c q))
 	    (+ (* b p) (* d q))))))
 
+(defun translate-matrix (mat trans)
+  (destructuring-bind (a b c d e f) mat
+    (destructuring-bind (x y) trans
+      (list a b c d (+ (* x a) (* y c) e) (+ (* x b) (* y d) f)))))
+
 (define-condition ps-eof (error) ())
 (define-condition ps-type-error (error) ())
 (define-condition key-error (error) ())
