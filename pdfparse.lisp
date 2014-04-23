@@ -237,6 +237,7 @@
 		      (pythonic-read (slot-value self 'fp)
 				     +ps-buf-size+))
 		(when (string= s "") (return))
+		(print s)
 		(loop
 		   (setf n (max (position #\Return s :from-end t)
 				(position #\Newline s :from-end t)))
@@ -2160,7 +2161,7 @@ allocated multiple times.
       fp (make-string-input-stream
 	  (get-data (stream-value (elt streams istream ))))
       istream (1+ istream))
-     (error (make-condition 'ps-eof "Unexpected EOF, file truncated?"))))))
+     (error 'ps-eof :info "Unexpected EOF, file truncated?")))))
 
 (defmethod parser-seek ((self pdf-content-parser) pos)
   (parser-fillfp self)
@@ -2777,17 +2778,19 @@ allocated multiple times.
 	       (ipush self obj))))))
 
 (defun make-pdf-input-stream (fname)
-  #+sbcl
-  (open fname :external-format :iso-8859-1)
-  #+ccl
-  (open fname :external-format (make-external-format :character-encoding :iso-8859-1 :line-terminatino :unix))
-  #-(or sbcl ccl)
-  (with-open-file (f fname :element-type '(unsigned-byte 8))
-    (make-string-input-stream
-     (with-output-to-string (out)
-       (loop with bytes = (make-array (* 1024 1024) :element-type '(unsigned-byte 8)
-				      (read-sequence bytes f)
-				      (write-sequence (map 'list #'code-char bytes) out)))))))
+  #+(or sbcl ccl ecl)
+  (let ((format
+	 #+sbcl :iso-8859-1
+	 #+ccl (make-external-format :character-encoding :iso-8859-1 :line-terminatino :unix)
+	 #+ecl'(:iso-8859-1 :lf)
+	 ))
+    (open fname :external-format format))
+  #+clisp
+  (flexi-streams:make-flexi-stream
+   (open fname :element-type '(unsigned-byte 8))
+   :external-format '(:latin-1 :eol-style :lf))
+  #-(or sbcl ccl ecl clisp)#.(error "Add a way to get a character stream for which file-posistion works on, and input encoding is windows-1252 while preserving #\Return and #\Newline characters for your implementation")
+  )
   
 (defun process-pdf (rsrcmgr device fp &key (pagenos nil) (maxpages 0)
 					(password "") (caching t) (check-extractable t))

@@ -75,9 +75,9 @@
     (destructuring-bind (x y) trans
       (list a b c d (+ (* x a) (* y c) e) (+ (* x b) (* y d) f)))))
 
-(define-condition ps-eof (error) ())
-(define-condition ps-type-error (error) ())
-(define-condition key-error (error) ())
+(define-condition ps-eof (error) ((info :initarg :info)))
+(define-condition ps-type-error (error) ((info :initarg :info)))
+(define-condition key-error (error) ((info :initarg :info)))
 
 (defun in-dict (k h)
   (nth-value 1 (gethash k h)))
