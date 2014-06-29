@@ -2293,7 +2293,7 @@ allocated multiple times.
 			 (<= 2 (length spec)))
 		    (make-pdf-color-space 
 		     name
-		     (length (list-value (first spec)))))
+		     (length (list-value (second spec)))))
 		   (t
 		    (gethash name +predefined-colorspace+))))))
 	(loop for k being the hash-keys of (dict-value resources)
@@ -2781,7 +2781,7 @@ allocated multiple times.
   #+(or sbcl ccl ecl)
   (let ((format
 	 #+sbcl :iso-8859-1
-	 #+ccl (make-external-format :character-encoding :iso-8859-1 :line-terminatino :unix)
+	 #+ccl (ccl::make-external-format :character-encoding :iso-8859-1 :line-termination :unix)
 	 #+ecl'(:iso-8859-1 :lf)
 	 ))
     (open fname :external-format format))

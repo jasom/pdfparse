@@ -1,7 +1,7 @@
 (defpackage :simple-pdf-device
   (:use :cl :pdfparse-device))
 
-(in-package simple-pdf-device)
+(in-package :simple-pdf-device)
 
 (defclass simple-pdf-device ()
   ((output-stream :initarg :output-stream)
