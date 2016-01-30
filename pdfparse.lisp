@@ -237,7 +237,7 @@
 		      (pythonic-read (slot-value self 'fp)
 				     +ps-buf-size+))
 		(when (string= s "") (return))
-		(print s)
+		;(print s)
 		(loop
 		   (setf n (max (position #\Return s :from-end t)
 				(position #\Newline s :from-end t)))
@@ -754,7 +754,7 @@ baa") (180 . "foobaa")
 
 (defclass my-parser (ps-stack-parser) ())
 (defmethod pdfparse::parser-flush ((self my-parser))
-  (print 'flush)
+  ;(print 'flush)
   (apply #'pdfparse::parser-add-results self (pdfparse::parser-popall self)))
 
 (defun get-objects (s)
@@ -789,7 +789,8 @@ baa") (180 . "foobaa")
      (if
       (equal obj1 obj2)
       t
-      (prog1 nil (print obj1) (print obj2) (terpri))))))
+      nil
+      ))))
      
 (defun test2 ()
   (assert (maxi-equal (get-objects +testdata+) +objs+)))
